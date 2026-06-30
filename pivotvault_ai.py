@@ -1400,7 +1400,6 @@ defaults = {
     'broker_connected':    False,
     # Scanner results
     'cpr_scan_df':         None,
-    'cpr_scan_15m':        None,
     'cpr_scan_30m':        None,
     'cpr_scan_1h':         None,
     'cpr_scan_1d':         None,
@@ -4366,9 +4365,9 @@ def page_watchlist():
         )
         return
 
-    # ── Build active signals map (15m + 1h only) ─────────────────────────
+    # ── Build active signals map (30m + 1h only) ─────────────────────────
     active_signals = {}
-    for tf_key, tf_label, tf_col in [("cpr_scan_15m","15Min","#e67e22"),("cpr_scan_1h","1Hour","#2980b9")]:
+    for tf_key, tf_label, tf_col in [("cpr_scan_30m","30Min","#ea580c"),("cpr_scan_1h","1Hour","#2980b9")]:
         raw = st.session_state.get(tf_key)
         df  = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame()
         if df.empty: continue
@@ -4694,20 +4693,23 @@ def compute_rr_levels(ltp: float, pattern_dir: str, tc: float, bc: float,
 @st.cache_data(ttl=900)
 
 def scan_cpr_multi_tf(symbols: list, interval: str, period: str,
-                      max_stocks: int = 200, engine: str = "legacy") -> pd.DataFrame:
+                      max_stocks: int = 200, engine: str = "ochoa") -> pd.DataFrame:
     """
     Frank Ochoa CPR Scanner — Enhanced with Upstox data + strategy rationale.
-    Timeframes: 15m / 30m / 1h / 1d / 1wk / 1mo
+    Timeframes: 30m / 1h / 1d / 1wk / 1mo
     Upstox used for data if token is active, else yfinance fallback.
     Each row includes a human-readable strategy rationale for backtest reference.
 
     engine:
-      "legacy" (default) — the original composite scorer (CPR + candlestick
-                            name-matching + RSI/VWAP/Stochastic/3-10 Osc blend)
-      "ochoa"             — the book-faithful Ochoa Core engine (ochoa_engine.py):
+      "ochoa"  (default) — the book-faithful Ochoa Core engine (ochoa_engine.py):
                             CPR core, true two-bar Wick/Extreme/Outside Reversal
                             rules, confirmed Doji Reversal, Camarilla H3/L3/H4/L4,
                             Money Zone — with Narrow CPR heavily weighted.
+                            This is the ONLY engine wired into the Scanner UI.
+      "legacy"            — retained in code for reference/testing only; the
+                            original composite scorer (CPR + candlestick
+                            name-matching + RSI/VWAP/Stochastic/3-10 Osc blend).
+                            No UI path calls this anymore.
     """
     rows = []
 
@@ -5816,20 +5818,24 @@ def _signal_rank_score_global(row, tf_tag: str) -> float:
 
 
 def _get_top5_best_trades(market_list: list) -> list:
+    # Only 30 Min — the sole auto-scan timeframe. Pure Ochoa Core engine.
     TF_SCAN_CONFIGS = [
-        {"interval": "15m", "period": "10d",  "tag": "15m", "label": "\u26a1 15 Min", "color": "#7c3aed"},
         {"interval": "30m", "period": "20d",  "tag": "30m", "label": "\u23f1\ufe0f 30 Min", "color": "#ea580c"},
-        {"interval": "1h",  "period": "60d",  "tag": "1h",  "label": "\U0001f55010 1 Hour", "color": "#1d4ed8"},
     ]
     def _scan_one_tf(cfg):
         try:
             result = scan_cpr_multi_tf(
                 market_list, interval=cfg["interval"],
                 period=cfg["period"], max_stocks=len(market_list),
+                engine="ochoa",
             )
             if result is None or result.empty: return []
             if "Pattern" not in result.columns: return []
             directional = result[result["Pattern"] != "Neutral"].copy()
+            if directional.empty: return []
+            # SL must be more than 0.50% away from entry — filters noise-prone tight stops
+            directional["_sl_pct"] = (directional["Entry"] - directional["SL"]).abs() / directional["Entry"] * 100
+            directional = directional[directional["_sl_pct"] > 0.50]
             if directional.empty: return []
             directional["_tf_tag"]     = cfg["tag"]
             directional["_tf_label"]   = cfg["label"]
@@ -5840,7 +5846,7 @@ def _get_top5_best_trades(market_list: list) -> list:
         except Exception:
             return []
     all_signals = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=len(TF_SCAN_CONFIGS)) as executor:
         futures = {executor.submit(_scan_one_tf, cfg): cfg for cfg in TF_SCAN_CONFIGS}
         try:
             for future in as_completed(futures, timeout=35):
@@ -5855,13 +5861,13 @@ def _get_top5_best_trades(market_list: list) -> list:
                     except Exception: pass
     if not all_signals: return []
     all_signals.sort(key=lambda x: x.get("_rank_score", 0), reverse=True)
-    seen, top5 = set(), []
+    seen, top10 = set(), []
     for sig in all_signals:
         sym = sig.get("Symbol", "")
         if sym and sym not in seen:
-            seen.add(sym); top5.append(sig)
-        if len(top5) >= 5: break
-    return top5
+            seen.add(sym); top10.append(sig)
+        if len(top10) >= 10: break
+    return top10
 
 def page_scanner_signals(nse500: pd.DataFrame):
     """CPR Scanner + Trade Signals merged."""
@@ -5914,13 +5920,13 @@ def page_scanner_signals(nse500: pd.DataFrame):
         st.markdown("<div style='font-family:DM Mono,monospace;font-size:0.72rem;color:#5a6a48;"
             "padding:0.4rem 0.9rem;margin-bottom:0.5rem;background:#f0f4e8;"
             "border-radius:6px;border-left:3px solid #4e6130;'>"
-            "⚡ <b>15 Min &amp; 30 Min &amp; 1 Hour</b> → Auto-scan + Forward Testing &nbsp;|&nbsp; "
-            "🖐 <b>1d / 1wk / 1mo</b> → Manual execution required &nbsp;|&nbsp; "
+            "⏱️ <b>30 Min</b> → Auto-scan + Auto Trade (Forward Testing) &nbsp;|&nbsp; "
+            "🖐 <b>1h / 1d / 1wk / 1mo</b> → Manual execution required &nbsp;|&nbsp; "
             "📡 <b>Data feed:</b> yfinance always active (Upstox enhances speed when token present)</div>",
             unsafe_allow_html=True)
 
         # ═══════════════════════════════════════════════════════════════════
-        #  🏆 TOP 5 BEST TRADES — AUTO-SCANNED ACROSS 15m · 30m · 1H
+        #  🏆 SUPER BEST 10 TRADES — 30 MIN AUTO-SCAN · OCHOA CORE
         # ═══════════════════════════════════════════════════════════════════
         _TOP5_KEY      = "top5_best_trades"
         _TOP5_TIME_KEY = "top5_best_trades_time"
@@ -5932,23 +5938,23 @@ def page_scanner_signals(nse500: pd.DataFrame):
             st.markdown(
                 "<div style='font-family:IBM Plex Mono,monospace;'>"
                 "<span style='font-size:1.5rem;'>🏆</span> "
-                "<b style='font-size:1rem;color:#1a1f0e;'>Top 5 Best Trades</b> "
+                "<b style='font-size:1rem;color:#1a1f0e;'>Super Best 10 Trades</b> "
                 "<span style='font-size:0.68rem;color:#5a6a48;'>"
-                "Auto-ranked across ⚡15m · ⏱️30m · 🕐1H · Frank Ochoa Score · Refreshes every 15 min"
+                "⏱️ 30 Min Auto-Scan · Frank Ochoa Core Score · SL &gt; 0.50% · Refreshes every 15 min"
                 "</span></div>", unsafe_allow_html=True)
         with _th2:
-            if st.button("🔄 Refresh Top 5", key="refresh_top5_btn", use_container_width=True):
+            if st.button("🔄 Refresh Top 10", key="refresh_top5_btn", use_container_width=True):
                 _top5_needs = True
                 st.session_state.pop(_TOP5_KEY, None)
 
         if _top5_needs or _TOP5_KEY not in st.session_state:
             _mkt_list = get_market_list(st.session_state.get("scanner_market", "🇮🇳 NSE 500"))
-            with st.spinner("⚡ Scanning 15m · 30m · 1H in parallel for best setups…"):
+            with st.spinner("⏱️ Scanning 30 Min · Ochoa Core for best setups…"):
                 _top5_result = _get_top5_best_trades(_mkt_list)
             st.session_state[_TOP5_KEY]      = _top5_result
             st.session_state[_TOP5_TIME_KEY] = time.time()
             _top5_age = 0
-            # ── Telegram: notify every Top 5 signal ──────────────────────
+            # ── Telegram: notify every Top 10 signal ──────────────────────
             if _top5_result:
                 _tg_cfg = st.session_state.get("telegram_cfg", {})
                 if _tg_cfg.get("notify_signals", True):
@@ -5957,10 +5963,10 @@ def page_scanner_signals(nse500: pd.DataFrame):
                         _ttag = _ts.get("_tf_tag", "—")
                         _tf_grp.setdefault(_ttag, []).append(_ts)
                     for _ttag, _tsigs in _tf_grp.items():
-                        _tf_map = {"15m":"⚡ 15 Min","30m":"⏱️ 30 Min","1h":"🕐 1 Hour"}
+                        _tf_map = {"30m":"⏱️ 30 Min"}
                         _tf_lbl = _tf_map.get(_ttag, _ttag.upper())
                         _summary = (
-                            f"🏆 <b>TOP SIGNALS — {_tf_lbl}</b>  [Auto Scan · Top 5]\n"
+                            f"🏆 <b>TOP SIGNALS — {_tf_lbl}</b>  [Auto Scan · Top 10]\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"🟢 Bullish: {sum(1 for x in _tsigs if x.get('Pattern','')=='Bullish')}   "
                             f"🔴 Bearish: {sum(1 for x in _tsigs if x.get('Pattern','')=='Bearish')}   "
@@ -5975,7 +5981,7 @@ def page_scanner_signals(nse500: pd.DataFrame):
         _top5_trades = st.session_state.get(_TOP5_KEY, [])
 
         if not _top5_trades:
-            st.info("📡 No top trades found — click **🔄 Refresh Top 5** to scan all 3 timeframes.")
+            st.info("📡 No top trades found — click **🔄 Refresh Top 10** to scan 30 Min.")
         else:
             _age_min = int(_top5_age / 60)
             st.markdown(
@@ -5984,8 +5990,11 @@ def page_scanner_signals(nse500: pd.DataFrame):
                 "Showing <b>" + str(len(_top5_trades)) + "</b> best unique setups</div>",
                 unsafe_allow_html=True)
 
-            _medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
-            _t5cols = st.columns(min(5, len(_top5_trades)))
+            _medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+            _ROW_SIZE = 5
+            _t5cols = []
+            for _row_start in range(0, len(_top5_trades), _ROW_SIZE):
+                _t5cols.extend(st.columns(min(_ROW_SIZE, len(_top5_trades) - _row_start)))
             for _idx, _sig in enumerate(_top5_trades):
                 _is_bull  = _sig.get("Pattern","") == "Bullish"
                 _hc       = "#16a34a" if _is_bull else "#dc2626"
@@ -6012,7 +6021,7 @@ def page_scanner_signals(nse500: pd.DataFrame):
                 _day_type = str(_sig.get("Day Type",""))
                 _cpr_w    = float(_sig.get("CPR Width%", 0))
                 _rr_col   = "#16a34a" if _rr >= 2.0 else ("#d97706" if _rr >= 1.5 else "#dc2626")
-                _medal    = _medals[_idx] if _idx < 5 else f"#{_idx+1}"
+                _medal    = _medals[_idx] if _idx < len(_medals) else f"#{_idx+1}"
                 if   _score >= 100: _grade, _gc = "A+","#16a34a"
                 elif _score >= 80:  _grade, _gc = "A", "#16a34a"
                 elif _score >= 65:  _grade, _gc = "B+","#d97706"
@@ -6079,7 +6088,6 @@ def page_scanner_signals(nse500: pd.DataFrame):
 
         # ── Manual TF scanner continues below ─────────────────────────────
         TF_CONFIG = {
-            "⚡ 15 Min  — Fast Scalping":   {"interval":"15m","period":"10d", "tag":"15m","refresh":900,   "color":"#7c3aed","bg":"#f5f3ff","label":"Fast Scalping",  "refresh_label":"15 min"},
             "⏱️ 30 Min  — Momentum":        {"interval":"30m","period":"20d", "tag":"30m","refresh":1800,  "color":"#ea580c","bg":"#fff7ed","label":"Momentum",       "refresh_label":"30 min"},
             "🕐 1 Hour  — Swing Scalping":  {"interval":"1h", "period":"60d", "tag":"1h", "refresh":3600,  "color":"#1d4ed8","bg":"#eff6ff","label":"Swing Scalping", "refresh_label":"1 hour"},
             "📅 1 Day   — Swing Trading":   {"interval":"1d", "period":"120d","tag":"1d", "refresh":14400, "color":"#1a6b3c","bg":"#edf7ee","label":"Swing Trading",  "refresh_label":"4 hours"},
@@ -6185,40 +6193,22 @@ def page_scanner_signals(nse500: pd.DataFrame):
             tf_choice = st.selectbox(
                 "Timeframe",
                 list(TF_CONFIG.keys()),
-                index=2,
+                index=0,   # default to 30 Min — the primary auto-scan timeframe
                 label_visibility="collapsed",
                 key="scanner_tf",
             )
         with c2:
             manual_btn = st.button("🔄 Scan Now", use_container_width=True, key="run_cpr_scan_btn")
 
-        # ── Scoring engine toggle ──────────────────────────────────────────────────
-        _ENGINE_OPTS = {
-            "📘 Ochoa Core (Book-Faithful)": "ochoa",
-            "🧩 Legacy Composite":           "legacy",
-        }
-        _engine_label = st.radio(
-            "Scoring Engine",
-            list(_ENGINE_OPTS.keys()),
-            index=0,
-            horizontal=True,
-            key="scanner_engine_choice",
-            help=("Ochoa Core: pure CPR + the four SPB reversal setups (true two-bar "
-                  "Wick/Extreme/Outside Reversal, confirmed Doji) + Camarilla H3/L3/H4/L4 "
-                  "+ Money Zone, weighted exactly as described in Secrets of a Pivot Boss, "
-                  "with Narrow CPR setups heavily favored. No generic indicators drive the "
-                  "score.\n\nLegacy Composite: the original blended scorer (CPR + candlestick "
-                  "name-matching + RSI/VWAP/Stochastic/3-10 Oscillator confluence)."
-        ))
-        scan_engine = _ENGINE_OPTS[_engine_label]
-        if scan_engine == "ochoa":
-            st.markdown(
-                "<div style='background:#eef5ff;border-left:3px solid #1d4ed8;"
-                "border-radius:6px;padding:0.4rem 0.9rem;margin-bottom:0.6rem;"
-                "font-family:DM Mono,monospace;font-size:0.68rem;color:#1e3a6e;'>"
-                "📘 <b>Ochoa Core</b> active — CPR · true 2-bar Extreme Reversal · Wick/Outside/Doji "
-                "Reversal · Camarilla H3/L3/H4/L4 · Money Zone. Narrow CPR setups score highest."
-                "</div>", unsafe_allow_html=True)
+        # ── Scoring engine: Ochoa Core only ──────────────────────────────────────
+        scan_engine = "ochoa"
+        st.markdown(
+            "<div style='background:#eef5ff;border-left:3px solid #1d4ed8;"
+            "border-radius:6px;padding:0.4rem 0.9rem;margin-bottom:0.6rem;"
+            "font-family:DM Mono,monospace;font-size:0.68rem;color:#1e3a6e;'>"
+            "📘 <b>Ochoa Core</b> — CPR · true 2-bar Extreme Reversal · Wick/Outside/Doji "
+            "Reversal · Camarilla H3/L3/H4/L4 · Money Zone. Narrow CPR setups score highest."
+            "</div>", unsafe_allow_html=True)
 
         cfg        = TF_CONFIG[tf_choice]
         tf_col     = cfg["color"]
@@ -6425,9 +6415,9 @@ def page_scanner_signals(nse500: pd.DataFrame):
                             continue
 
                         if auto_traded < 3:
-                            # ── AUTO-TRADE GATE: Only 30m + 1h timeframes ──
-                            # 15m excluded — too noisy, tight SL, high false signals
-                            if tf_tag not in ("30m", "1h"):
+                            # ── AUTO-TRADE GATE: 30 Min ONLY ──
+                            # 1h/1d/1wk/1mo are manual-execution timeframes
+                            if tf_tag != "30m":
                                 continue
                             ft_add_signal(sig, source=f"🤖 Auto·Top3 · {tf_tag.upper()}")
                             ranked.loc[_ri, "🤖 Auto"] = "🤖 Auto"
@@ -6574,6 +6564,19 @@ def page_scanner_signals(nse500: pd.DataFrame):
         if "Strength%"  not in scan_df.columns: scan_df["Strength%"]  = 0.0
         all_bull = scan_df[scan_df["Pattern"] == "Bullish"].copy()
         all_bear = scan_df[scan_df["Pattern"] == "Bearish"].copy()
+
+        # ── SL quality filter — only entries where SL is MORE than 0.50% away
+        #    from entry price survive. Filters out noise-prone, too-tight stops. ──
+        def _filter_sl_gt_half_pct(df_side: pd.DataFrame) -> pd.DataFrame:
+            if df_side.empty or "Entry" not in df_side.columns or "SL" not in df_side.columns:
+                return df_side
+            entry = pd.to_numeric(df_side["Entry"], errors="coerce")
+            sl    = pd.to_numeric(df_side["SL"], errors="coerce")
+            sl_pct = (entry - sl).abs() / entry.replace(0, np.nan) * 100
+            return df_side[sl_pct > 0.50].copy()
+
+        all_bull = _filter_sl_gt_half_pct(all_bull)
+        all_bear = _filter_sl_gt_half_pct(all_bear)
 
         # ── Summary metrics ───────────────────────────────────────────────────────
         n_scanned = len(scan_df)
@@ -6937,11 +6940,11 @@ def page_scanner_signals(nse500: pd.DataFrame):
                     padding:0.9rem 1.1rem;margin-top:0.75rem;
                     font-family:IBM Plex Mono,monospace;font-size:0.7rem;color:#5a6a48;line-height:1.9;">
         <b style="color:#1a1f0e;">Auto-Refresh Schedule</b><br>
-        ⚡ 15 Min chart → refreshes every <b>15 minutes</b> &nbsp;|&nbsp;
+        ⏱️ 30 Min chart → refreshes every <b>30 minutes</b> &nbsp;|&nbsp;
         🕐 1 Hour chart → refreshes every <b>1 hour</b> &nbsp;|&nbsp;
         📅 1 Day chart → refreshes every <b>4 hours</b> &nbsp;|&nbsp;
         📆 1 Week / 🗓️ 1 Month → refresh every <b>24 hours</b><br>
-        <b style="color:#1a1f0e;">Filter:</b> Narrow CPR &lt; 0.25% · Strength 85–100% · Top 10 per direction · NSE 500
+        <b style="color:#1a1f0e;">Filter:</b> Narrow CPR &lt; 0.25% · Strength 85–100% · Top 10 per direction · SL &gt; 0.50% · NSE 500
         </div>
         """, unsafe_allow_html=True)
 
@@ -6949,10 +6952,10 @@ def page_scanner_signals(nse500: pd.DataFrame):
         st.markdown("<div style='font-family:DM Mono,monospace;font-size:0.72rem;color:#5a6a48;"
             "padding:0.4rem 0.9rem;margin-bottom:0.75rem;background:#f0f4e8;"
             "border-radius:6px;border-left:3px solid #4e6130;'>"
-            "⚡ All scans (manual + auto, all timeframes) appear here &nbsp;|&nbsp; "
+            "📘 Ochoa Core · Top 10 per timeframe · SL &gt; 0.50% from entry &nbsp;|&nbsp; "
             "🧪 <b>Fwd Test</b> = paper trade &nbsp;|&nbsp; "
             "🤖 <b>Auto Trade</b> = instant FT entry + Upstox order &nbsp;|&nbsp; "
-            "🕐 Auto window: <b>9:45–14:45 IST</b> · Str≥75% · RR≥2.0</div>",
+            "🕐 Auto window (30 Min only): <b>9:45–14:45 IST</b> · Str≥75% · RR≥2.0</div>",
             unsafe_allow_html=True)
         import json
 
@@ -7013,7 +7016,7 @@ def page_scanner_signals(nse500: pd.DataFrame):
             </script>
             """, unsafe_allow_html=True)
 
-        # ── Auto-refresh: inherit from scanner (15m & 1h only) ────────────────
+        # ── Auto-refresh: inherit from scanner (30 Min only) ────────────────
         if _HAS_AUTOREFRESH and is_market_open():
             st_autorefresh(interval=15_000, limit=None, key="signals_autorefresh")
         # Also track 30m scan time
@@ -7024,7 +7027,6 @@ def page_scanner_signals(nse500: pd.DataFrame):
         # ── Pull signals from ALL scans (auto + manual) ────────────────────────
         # tf_filter_key must match the multiselect options exactly
         TF_LABELS = {
-            "cpr_scan_15m":  ("⚡ 15 Min",  "#7c3aed", "15m",  "⚡ 15 Min"),
             "cpr_scan_30m":  ("⏱️ 30 Min",  "#ea580c", "30m",  "⏱️ 30 Min"),
             "cpr_scan_1h":   ("🕐 1 Hour",  "#1d4ed8", "1h",   "🕐 1 Hour"),
             "cpr_scan_1d":   ("📅 Daily",   "#0f766e", "1d",   "📅 Daily"),
@@ -7041,7 +7043,24 @@ def page_scanner_signals(nse500: pd.DataFrame):
             ts = st.session_state.get(f"cpr_scan_time_{tag}", 0)
             if not df.empty:
                 scan_times[label] = datetime.fromtimestamp(ts).strftime("%d %b %H:%M") if ts else "—"
-                for _, r in df.iterrows():
+
+                # ── SL must be MORE than 0.50% away from entry — drop noise-prone
+                #    tight stops before anything else is ranked or capped ──────────
+                _df = df.copy()
+                if "Entry" in _df.columns and "SL" in _df.columns:
+                    _entry = pd.to_numeric(_df["Entry"], errors="coerce")
+                    _sl    = pd.to_numeric(_df["SL"], errors="coerce")
+                    _sl_pct = (_entry - _sl).abs() / _entry.replace(0, np.nan) * 100
+                    _df = _df[_sl_pct > 0.50]
+
+                # ── Super Best 10 per timeframe — ranked by Strength% then
+                #    tightest CPR width, capped to 10 before reaching Signals ──
+                if not _df.empty and "Strength%" in _df.columns:
+                    _df = _df.sort_values(
+                        ["Strength%", "CPR Width%"], ascending=[False, True]
+                    ).head(10)
+
+                for _, r in _df.iterrows():
                     _sig = {
                         "tf":       tf_filter_key,   # matches multiselect options exactly
                         "tf_label": label,            # full label with AUTO badge for display
@@ -7113,7 +7132,7 @@ def page_scanner_signals(nse500: pd.DataFrame):
             ts = st.session_state.get(f"cpr_scan_time_{tag}", 0)
             return ts > 0 and (now_ts - ts) > intraday_secs
         any_stale = any([
-            _is_stale("15m",  1800), _is_stale("30m",  3600),
+            _is_stale("30m",  3600),
             _is_stale("1h",   7200), _is_stale("1d",  14400),
             _is_stale("1wk", 86400), _is_stale("1mo", 86400),
         ])
@@ -7141,8 +7160,8 @@ def page_scanner_signals(nse500: pd.DataFrame):
         # ── Filters ───────────────────────────────────────────────────────────
         fc1, fc2, fc3, fc4 = st.columns([2, 2, 1.5, 1.5])
         with fc1:
-            tf_filter = st.multiselect("Timeframe", ["⚡ 15 Min","⏱️ 30 Min","🕐 1 Hour","📅 Daily","📆 Weekly","🗓️ Monthly"],
-                                        default=["⚡ 15 Min","⏱️ 30 Min","🕐 1 Hour","📅 Daily","📆 Weekly","🗓️ Monthly"],
+            tf_filter = st.multiselect("Timeframe", ["⏱️ 30 Min","🕐 1 Hour","📅 Daily","📆 Weekly","🗓️ Monthly"],
+                                        default=["⏱️ 30 Min","🕐 1 Hour","📅 Daily","📆 Weekly","🗓️ Monthly"],
                                         key="sig_tf_filter", label_visibility="collapsed")
         with fc2:
             side_filter = st.radio("Direction", ["All","BUY only","SELL only"],

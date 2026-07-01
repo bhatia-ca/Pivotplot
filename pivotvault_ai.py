@@ -4870,10 +4870,12 @@ def scan_cpr_multi_tf(symbols: list, interval: str, period: str,
         df_out = df_out.rename(columns={"P": "Pivot P"})
         df_out["Candle"] = "—"   # legacy candle-name column not used by the Ochoa engine
         keep_cols = ["Symbol","LTP","CPR Width%","CPR Type","Virgin CPR","Strategy",
+                     "Named Strategy","Strategy Why",
                      "Rationale","TC","BC","Pivot P","R1","R2","R3","S1","S2","S3",
                      "Pattern","Candle","Strength%","Day Type","CPR Overlap","RSI","HMA",
                      "ATR","Stoch%K","Vol Surge","Osc Cross","Entry","SL","T1","T2","T3",
-                     "RR1","RR2","Risk Rs","Camarilla","Two-Day","Ochoa Score"]
+                     "RR1","RR2","Risk Rs","Camarilla","Two-Day","Ochoa Score",
+                     "SL Dist%","Entry-Spot Gap%"]
         for c in keep_cols:
             if c not in df_out.columns:
                 df_out[c] = "—"
@@ -6643,10 +6645,22 @@ def page_scanner_signals(nse500: pd.DataFrame):
                 osc      = str(row.get("Osc Cross", "—"))
                 vol      = str(row.get("Vol Surge", "—"))
                 cpr_w    = float(row.get("CPR Width%", 0))
+                named    = str(row.get("Named Strategy", "—"))
+                named_why= str(row.get("Strategy Why", ""))
+
+                named_badge = ""
+                if named and named != "—":
+                    named_badge = (
+                        f'<div style="display:inline-block;background:linear-gradient(135deg,{hc}22,{hc}11);'
+                        f'border:1px solid {hc};border-radius:6px;padding:0.2rem 0.55rem;margin-bottom:0.4rem;'
+                        f'font-family:IBM Plex Mono,monospace;font-size:0.72rem;font-weight:700;color:{hc};" '
+                        f'title="{named_why}">{named}</div>'
+                    )
 
                 html += (
                     f'<div style="background:#fff;border:1px solid {hbd};border-radius:10px;'
                     f'padding:0.85rem 1rem;margin-bottom:0.5rem;box-shadow:0 1px 5px rgba(0,0,0,0.05);">'
+                    f'{named_badge}'
                     f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.4rem;">'
                     f'<div style="display:flex;align-items:center;gap:8px;">'
                     f'<span style="font-size:1rem;">{medal}</span>'
@@ -7086,9 +7100,19 @@ def page_scanner_signals(nse500: pd.DataFrame):
                         "atr":       r.get("ATR", 0),
                         "stoch":     r.get("Stoch%K", "—"),
                         "rationale": r.get("Rationale",""),
+                        "named_strategy": r.get("Named Strategy","—"),
+                        "strategy_why":   r.get("Strategy Why","—"),
+                        "sl_dist_pct":    r.get("SL Dist%", 0),
+                        "entry_spot_gap_pct": r.get("Entry-Spot Gap%", 0),
                     }
                     _sig["strategy_name"] = _build_strategy_name(_sig)
                     _sig["strategy_id"]   = _strategy_short_id(_sig)
+                    # If the Ochoa engine matched one of the 5 named book combos,
+                    # that name takes priority over the generic auto-built label —
+                    # it's grounded in the actual fired setups, not RSI/HMA/Vol
+                    # sentinels that the Ochoa engine doesn't compute.
+                    if r.get("Named Strategy", "—") != "—":
+                        _sig["strategy_name"] = r["Named Strategy"]
                     all_signals.append(_sig)
 
         # ── Status bar ────────────────────────────────────────────────────────
@@ -7220,7 +7244,7 @@ def page_scanner_signals(nse500: pd.DataFrame):
                   color:{ac};background:{bg};border:1px solid {bdr};
                   border-radius:6px;padding:3px 8px;margin-bottom:7px;
                   letter-spacing:0.03em;line-height:1.4;">
-        🎯 {s.get('strategy_name','—')}
+        {s.get('strategy_name','—') if s.get('named_strategy','—') != '—' else '🎯 ' + s.get('strategy_name','—')}
       </div>
       <!-- Header row -->
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
@@ -7246,7 +7270,7 @@ def page_scanner_signals(nse500: pd.DataFrame):
                   font-family:DM Mono,monospace;font-size:0.68rem;
                   color:{ac};font-weight:700;letter-spacing:0.02em;
                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-        🎯 {s.get('strategy_name','—')}
+        {s.get('strategy_name','—') if s.get('named_strategy','—') != '—' else '🎯 ' + s.get('strategy_name','—')}
       </div>
       <!-- Level pills -->
       <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:8px;">

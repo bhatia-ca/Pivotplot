@@ -420,6 +420,97 @@ WEIGHTS = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 6B — THE TOP 5 NAMED STRATEGY COMBINATIONS
+# ═══════════════════════════════════════════════════════════════════════
+# Each entry is checked in priority order (highest conviction first) against
+# the set of setup-name "families" that actually fired for a given signal.
+# A signal can only carry ONE named combo — the first (highest-priority)
+# match wins, since matching a higher combo implies the lower ones are
+# already a subset of the evidence.
+
+def _setup_families(fired_names: set) -> dict:
+    """Collapse the raw fired-setup names into boolean family flags used
+    by the combo classifier below."""
+    has_narrow_trending = "Narrow CPR (Trending)" in fired_names
+    has_narrow_any        = has_narrow_trending or "Narrow CPR (Moderate)" in fired_names
+    has_extreme         = any(n.startswith("Extreme Reversal") for n in fired_names)
+    has_two_day_hl       = any(n.startswith("Two-Day CPR: Higher") or n.startswith("Two-Day CPR: Lower") for n in fired_names)
+    has_outside_rev      = any(n.startswith("Outside Reversal") for n in fired_names)
+    has_wick_rev         = any(n.startswith("Wick Reversal") for n in fired_names)
+    has_doji_rev         = any(n.startswith("Doji Reversal") for n in fired_names)
+    has_virgin           = "Virgin CPR" in fired_names
+    has_cpr_position     = "CPR Position" in fired_names
+    has_cam_breakout     = any(n.startswith("Camarilla") and "Breakout" in n for n in fired_names)
+    has_cam_reversal     = any(n.startswith("Camarilla") and "Reversal" in n for n in fired_names)
+    has_two_day_coil     = any(n.startswith("Two-Day CPR: Inside Value") for n in fired_names)
+    has_money_zone       = "Money Zone" in fired_names
+    return dict(
+        narrow_trending=has_narrow_trending, narrow_any=has_narrow_any, extreme=has_extreme,
+        two_day_hl=has_two_day_hl, outside_rev=has_outside_rev, wick_rev=has_wick_rev,
+        doji_rev=has_doji_rev, virgin=has_virgin, cpr_position=has_cpr_position,
+        cam_breakout=has_cam_breakout, cam_reversal=has_cam_reversal,
+        two_day_coil=has_two_day_coil, money_zone=has_money_zone,
+    )
+
+
+def classify_named_strategy(setups_fired: list) -> dict | None:
+    """
+    Returns the single best-matching named strategy for this signal, or
+    None if the fired setups don't form one of the 5 recognized combos.
+    Checked in priority order — highest-conviction combo wins.
+
+    NOTE on Coiled Spring: an Extreme Reversal's qualifying bar is, by
+    definition, >=2x the average range — and CPR width is computed from
+    that same reference bar. This means requiring strict Narrow-Trending
+    (<0.25%) CPR at the same time as Extreme Reversal is close to
+    mathematically unreachable for normally-volatile stocks (the
+    oversized bar's own range typically already pushes width past 0.25%).
+    Coiled Spring therefore accepts Narrow-Trending OR Narrow-Moderate
+    (<0.50%) CPR alongside Extreme Reversal + Two-Day confirmation —
+    still the most demanding combo, but actually reachable.
+    """
+    fired_names = {s["name"] for s in setups_fired}
+    f = _setup_families(fired_names)
+
+    # 1. THE COILED SPRING — Narrow CPR (Trending or Moderate) + Extreme Reversal + Two-Day Higher/Lower
+    if f["narrow_any"] and f["extreme"] and f["two_day_hl"]:
+        return {"id": "coiled_spring", "name": "🌀 The Coiled Spring", "rank": 1,
+                "why": "Tight compressed CPR + a failed over-extension snap-back, confirmed by "
+                       "a multi-day directional shift — the highest-conviction combo the engine can produce."}
+
+    # 2. THE SNAPBACK — Narrow CPR (Trending or Moderate) + Extreme Reversal
+    #    Same structural reasoning as Coiled Spring above: strict <0.25% width
+    #    is rarely reachable simultaneously with a >=2x-oversized reference bar.
+    if f["narrow_any"] and f["extreme"]:
+        return {"id": "snapback", "name": "⚡ The Snapback", "rank": 2,
+                "why": "An oversized directional bar failed to get continuation on the very next bar, "
+                       "inside a tight, trend-primed CPR — Ochoa's 'rubber band' reversal."}
+
+    # 3. THE FALSE BREAKOUT FADE — Narrow CPR + Outside Reversal (+ optional Camarilla confirmation)
+    if f["narrow_trending"] and f["outside_rev"]:
+        return {"id": "false_breakout_fade", "name": "🎭 The False Breakout Fade", "rank": 3,
+                "why": "Price swept beyond the prior bar's full range then closed back inside, "
+                       "opposite to the breakout — a trapped-trader fade inside a narrow CPR."}
+
+    # 4. THE TREND CONTINUATION — Narrow CPR + Two-Day Higher/Lower Value (no reversal candle needed)
+    if f["narrow_trending"] and f["two_day_hl"]:
+        return {"id": "trend_continuation", "name": "🚂 The Trend Continuation", "rank": 4,
+                "why": "Today's CPR is tight and trend-primed, sitting entirely above/below "
+                       "yesterday's CPR — clean directional structure with no reversal pattern required."}
+
+    # 5. THE CLEAN BREAKOUT — CPR Position + Virgin CPR + Camarilla H4/L4 Breakout
+    if f["cpr_position"] and f["virgin"] and f["cam_breakout"]:
+        return {"id": "clean_breakout", "name": "🚀 The Clean Breakout", "rank": 5,
+                "why": "Price broke a CPR that has never been retested since it formed, and that "
+                       "break carried far enough to also clear the Camarilla breakout layer."}
+
+    return None
+
+
+
+
+
 def score_ochoa_signal(df: pd.DataFrame, interval: str = "1d",
                         compute_market_profile_fn=None) -> dict | None:
     """
@@ -611,6 +702,25 @@ def score_ochoa_signal(df: pd.DataFrame, interval: str = "1d",
     if rr1 < MIN_RR:
         return None   # quality gate — no signal with sub-1R reward is worth surfacing
 
+    # ── Quality gate: Entry must be near the current spot price ─────────
+    # Entry is pivot-anchored (max/min of LTP vs TC/BC) and can occasionally
+    # drift away from where the stock is actually trading right now. Reject
+    # signals where that drift exceeds a sane execution tolerance.
+    MAX_ENTRY_SPOT_GAP_PCT = 0.75
+    entry_spot_gap_pct = abs(entry - ltp) / ltp * 100 if ltp else 999
+    if entry_spot_gap_pct > MAX_ENTRY_SPOT_GAP_PCT:
+        return None
+
+    # ── Quality gate: Stop-loss must be at least 0.50% away from entry ──
+    # Filters out noise-prone, too-tight stops that get hit by normal chop.
+    MIN_SL_DISTANCE_PCT = 0.50
+    sl_distance_pct = abs(entry - sl) / entry * 100 if entry else 0
+    if sl_distance_pct < MIN_SL_DISTANCE_PCT:
+        return None
+
+    # ── Named strategy classification (Top 5 combos) ────────────────────
+    named_strategy = classify_named_strategy(setups)
+
     return {
         "side": side,
         "score": score,
@@ -620,10 +730,13 @@ def score_ochoa_signal(df: pd.DataFrame, interval: str = "1d",
         "narrow_bonus_applied": narrow_bonus_applied,
         "two_day_relation": two_day["relation"] if two_day else None,
         "setups_fired": setups,
+        "named_strategy": named_strategy,
         "camarilla": cam,
         "camarilla_setup": cam_setup,
         "money_zone": mz,
         "entry": entry, "sl": sl,
+        "entry_spot_gap_pct": round(entry_spot_gap_pct, 3),
+        "sl_distance_pct": round(sl_distance_pct, 3),
         "t1": t1, "t2": t2, "t3": t3,
         "rr1": rr1, "rr2": rr2,
         "P": round(P, 2), "BC": round(BC, 2), "TC": round(TC, 2),
@@ -649,6 +762,7 @@ def score_ochoa_batch(sym_data: dict, interval: str,
         if not sig:
             continue
         fired_names = " · ".join(s["name"] for s in sig["setups_fired"][:3])
+        named = sig.get("named_strategy")
         rows.append({
             "Symbol":      sym,
             "LTP":         round(float(df["Close"].iloc[-1]), 2),
@@ -661,10 +775,14 @@ def score_ochoa_batch(sym_data: dict, interval: str,
             "Two-Day":     sig["two_day_relation"] or "—",
             "Virgin CPR":  "⭐ Yes" if sig["virgin_cpr"] else "—",
             "Setups":      fired_names,
+            "Named Strategy": named["name"] if named else "—",
+            "Strategy Why":   named["why"] if named else "—",
             "Camarilla":   sig["camarilla_setup"]["setup"] if sig["camarilla_setup"] else "—",
             "Entry":       sig["entry"], "SL": sig["sl"],
             "T1": sig["t1"], "T2": sig["t2"], "T3": sig["t3"],
             "RR1": sig["rr1"], "RR2": sig["rr2"],
+            "SL Dist%":    sig.get("sl_distance_pct", 0),
+            "Entry-Spot Gap%": sig.get("entry_spot_gap_pct", 0),
             "P": sig["P"], "BC": sig["BC"], "TC": sig["TC"],
             "_setups_detail": sig["setups_fired"],
         })

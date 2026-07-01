@@ -5836,7 +5836,9 @@ def _get_top5_best_trades(market_list: list) -> list:
             directional = result[result["Pattern"] != "Neutral"].copy()
             if directional.empty: return []
             # SL must be more than 0.50% away from entry — filters noise-prone tight stops
-            directional["_sl_pct"] = (directional["Entry"] - directional["SL"]).abs() / directional["Entry"] * 100
+            _e = pd.to_numeric(directional["Entry"], errors="coerce").fillna(0)
+            _s = pd.to_numeric(directional["SL"],    errors="coerce").fillna(0)
+            directional["_sl_pct"] = np.where(_e > 0, (_e - _s).abs() / _e * 100, 0.0)
             directional = directional[directional["_sl_pct"] > 0.50]
             if directional.empty: return []
             directional["_tf_tag"]     = cfg["tag"]
@@ -6572,9 +6574,10 @@ def page_scanner_signals(nse500: pd.DataFrame):
         def _filter_sl_gt_half_pct(df_side: pd.DataFrame) -> pd.DataFrame:
             if df_side.empty or "Entry" not in df_side.columns or "SL" not in df_side.columns:
                 return df_side
-            entry = pd.to_numeric(df_side["Entry"], errors="coerce")
-            sl    = pd.to_numeric(df_side["SL"], errors="coerce")
-            sl_pct = (entry - sl).abs() / entry.replace(0, np.nan) * 100
+            entry = pd.to_numeric(df_side["Entry"], errors="coerce").fillna(0)
+            sl    = pd.to_numeric(df_side["SL"],    errors="coerce").fillna(0)
+            # safe division — treat zero-entry rows as 0% SL distance (they'll be filtered out)
+            sl_pct = np.where(entry > 0, (entry - sl).abs() / entry * 100, 0.0)
             return df_side[sl_pct > 0.50].copy()
 
         all_bull = _filter_sl_gt_half_pct(all_bull)
@@ -7062,9 +7065,9 @@ def page_scanner_signals(nse500: pd.DataFrame):
                 #    tight stops before anything else is ranked or capped ──────────
                 _df = df.copy()
                 if "Entry" in _df.columns and "SL" in _df.columns:
-                    _entry = pd.to_numeric(_df["Entry"], errors="coerce")
-                    _sl    = pd.to_numeric(_df["SL"], errors="coerce")
-                    _sl_pct = (_entry - _sl).abs() / _entry.replace(0, np.nan) * 100
+                    _entry = pd.to_numeric(_df["Entry"], errors="coerce").fillna(0)
+                    _sl    = pd.to_numeric(_df["SL"],    errors="coerce").fillna(0)
+                    _sl_pct = np.where(_entry > 0, (_entry - _sl).abs() / _entry * 100, 0.0)
                     _df = _df[_sl_pct > 0.50]
 
                 # ── Super Best 10 per timeframe — ranked by Strength% then

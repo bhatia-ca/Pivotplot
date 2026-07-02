@@ -5836,10 +5836,13 @@ def _get_top5_best_trades(market_list: list) -> list:
             directional = result[result["Pattern"] != "Neutral"].copy()
             if directional.empty: return []
             # SL must be more than 0.50% away from entry — filters noise-prone tight stops
-            _e = pd.to_numeric(directional["Entry"], errors="coerce").fillna(0)
-            _s = pd.to_numeric(directional["SL"],    errors="coerce").fillna(0)
-            directional["_sl_pct"] = np.where(_e > 0, np.abs(_e - _s) / _e * 100, 0.0)
-            directional = directional[directional["_sl_pct"] > 0.50]
+            try:
+                _e = pd.to_numeric(directional["Entry"], errors="coerce").fillna(0).values
+                _s = pd.to_numeric(directional["SL"],    errors="coerce").fillna(0).values
+                _sl_pct = np.where(_e > 0, np.abs(_e - _s) / np.where(_e > 0, _e, 1) * 100, 0.0)
+                directional = directional.iloc[_sl_pct > 0.50].copy()
+            except Exception:
+                pass
             if directional.empty: return []
             directional["_tf_tag"]     = cfg["tag"]
             directional["_tf_label"]   = cfg["label"]
@@ -6574,11 +6577,14 @@ def page_scanner_signals(nse500: pd.DataFrame):
         def _filter_sl_gt_half_pct(df_side: pd.DataFrame) -> pd.DataFrame:
             if df_side.empty or "Entry" not in df_side.columns or "SL" not in df_side.columns:
                 return df_side
-            entry = pd.to_numeric(df_side["Entry"], errors="coerce").fillna(0)
-            sl    = pd.to_numeric(df_side["SL"],    errors="coerce").fillna(0)
-            # safe division — treat zero-entry rows as 0% SL distance (they'll be filtered out)
-            sl_pct = np.where(entry > 0, np.abs(entry - sl) / entry * 100, 0.0)
-            return df_side[sl_pct > 0.50].copy()
+            try:
+                entry = pd.to_numeric(df_side["Entry"], errors="coerce").fillna(0).values
+                sl    = pd.to_numeric(df_side["SL"],    errors="coerce").fillna(0).values
+                sl_pct = np.where(entry > 0, np.abs(entry - sl) / np.where(entry > 0, entry, 1) * 100, 0.0)
+                mask = sl_pct > 0.50
+                return df_side.iloc[mask].copy()
+            except Exception:
+                return df_side
 
         all_bull = _filter_sl_gt_half_pct(all_bull)
         all_bear = _filter_sl_gt_half_pct(all_bear)
@@ -7065,10 +7071,13 @@ def page_scanner_signals(nse500: pd.DataFrame):
                 #    tight stops before anything else is ranked or capped ──────────
                 _df = df.copy()
                 if "Entry" in _df.columns and "SL" in _df.columns:
-                    _entry = pd.to_numeric(_df["Entry"], errors="coerce").fillna(0)
-                    _sl    = pd.to_numeric(_df["SL"],    errors="coerce").fillna(0)
-                    _sl_pct = np.where(_entry > 0, np.abs(_entry - _sl) / _entry * 100, 0.0)
-                    _df = _df[_sl_pct > 0.50]
+                    try:
+                        _entry = pd.to_numeric(_df["Entry"], errors="coerce").fillna(0).values
+                        _sl    = pd.to_numeric(_df["SL"],    errors="coerce").fillna(0).values
+                        _sl_pct = np.where(_entry > 0, np.abs(_entry - _sl) / np.where(_entry > 0, _entry, 1) * 100, 0.0)
+                        _df = _df.iloc[_sl_pct > 0.50].copy()
+                    except Exception:
+                        pass
 
                 # ── Super Best 10 per timeframe — ranked by Strength% then
                 #    tightest CPR width, capped to 10 before reaching Signals ──
